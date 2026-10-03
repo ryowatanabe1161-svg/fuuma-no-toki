@@ -206,6 +206,8 @@
     if (!seat || host.conns[conn.clientId] !== conn) return;
     host.lastSeen[conn.clientId] = Date.now();
     if (m.t === 'ping') return;
+    if (m.t === 'lobbyReq') return hostLobbyReq(seat);
+    if (m.t === 'abort') return;   // 中断できるのはホストだけ（参加者からの abort は無視）
     if (m.t === 'play' || m.t === 'end') return hostAct(seat, m, conn);
     if (m.t === 'signal') return hostSignal(seat, m);
     if (m.t === 'react') return hostReact(seat, m);
@@ -332,6 +334,8 @@
     var R = host.room, G = R.G;
     var v = { t: 'state', phase: R.phase, code: R.code, you: sid, log: R.log.slice(0, 6), ev: R.ev, reacts: R.reacts,
       seats: R.seats.map(function (s) { return { sid: s.sid, name: s.name, kind: s.kind, connected: s.kind !== 'remote' || s.connected }; }) };
+    v.notice = R.notice || null;
+    if (sid === 1 && R.lobbyReq && R.phase !== 'lobby') v.lobbyReq = R.lobbyReq;
     if (!G || R.phase === 'lobby') return v;
     v.seats.forEach(function (s) { s.hand = G.hands[s.sid] ? G.hands[s.sid].length : 0; });
     v.gid = R.gid; v.mv = G.moves; v.piles = G.piles.map(function (p) { return { d: p.d, t: p.t, n: p.n }; });
@@ -344,6 +348,23 @@
       v.reveal = { hands: G.hands, deckLeft: G.deck.length };   // 決着後だけ公開
     }
     return v;
+  }
+  // ---- 中断してロビーへ（ホストのみ）：部屋コード・接続中の参加者・設定はそのまま ----
+  function hostToLobby(msg) {
+    var R = host.room;
+    R.phase = 'lobby'; R.G = null; R.ev = null; R.sig = [{}, {}, {}, {}]; R.danger = 0;
+    R.seats = R.seats.filter(function (s) { return s.kind !== 'remote' || s.connected; });
+    R.lobbyReq = null; R.notice = { id: (R.notice ? R.notice.id : 0) + 1, msg: msg };
+    addLog(msg);
+    hostBroadcast();
+  }
+  function hostLobbyReq(seat) {   // 参加者の「ロビーに戻りたい」：ホストに知らせるだけ
+    var R = host.room;
+    if (seat.kind !== 'remote' || R.phase === 'lobby') return;
+    if (R.lobbyReq && R.lobbyReq.sid === seat.sid && Date.now() - R.lobbyReq.at < 5000) return;
+    R.lobbyReq = { sid: seat.sid, name: seat.name, at: Date.now() };
+    addLog('🙋 ' + seat.name + '「ロビーに戻りたい」');
+    hostBroadcast();
   }
   function hostBroadcast() {
     var R = host.room;
@@ -373,7 +394,7 @@
     var b = e.target.closest('button'); if (!b || !host) return;
     var R = host.room;
     if (b.dataset.a === 'again') hostStartGame();
-    else if (b.dataset.a === 'lobby') { R.phase = 'lobby'; R.G = null; R.ev = null; addLog('ロビーに戻りました'); hostBroadcast(); }
+    else if (b.dataset.a === 'lobby') hostToLobby('ロビーに戻りました');
   });
   $('hostbar').addEventListener('click', function (e) {
     var b = e.target.closest('button'); if (!b || !host) return;
@@ -459,7 +480,36 @@
       });
     } else confirmBox('部屋を出ますか？', 'ゲーム中に出ても、同じ名前で入り直せば元の席に戻れます。', '部屋を出る', function () { sstore(SS_CLIENT, null); leaveClient(true); });
   }
-  $('leaveBtn1').onclick = $('leaveBtn2').onclick = $('menuBtn').onclick = leaveRoom;
+  $('leaveBtn1').onclick = $('leaveBtn2').onclick = leaveRoom;
+  // ⋯メニュー：ホスト＝「中断してロビーに戻る」（確認あり）／部屋を閉じる。参加者＝「ロビーに戻りたい」をホストに伝える／退出する
+  ['menuBtn'].forEach(function (id) { if ($(id)) $(id).onclick = function () { overlay('menuModal', true); }; });
+  function confirmAbort() {
+    confirmBox('中断してロビーに戻りますか？', 'いまのゲームを終了して、全員をこの部屋のロビーに戻します。部屋コード・参加者・設定はそのままです。', '中断してロビーへ', function () {
+      if (host && host.room.phase !== 'lobby') hostToLobby('⏸️ ホストがゲームを中断しました');
+    });
+  }
+  $('menuAbort').onclick = function () { overlay('menuModal', false); confirmAbort(); };
+  $('menuReq').onclick = function () { overlay('menuModal', false); if (client && client.conn && client.conn.open) client.conn.send({ t: 'lobbyReq' }); toast('ホストに「ロビーに戻りたい」と伝えました'); };
+  $('menuLeave').onclick = function () { overlay('menuModal', false); leaveRoom(); };
+  $('menuRules').onclick = function () { overlay('menuModal', false); overlay('rulesModal', true); };
+  $('menuClose').onclick = function () { overlay('menuModal', false); };
+  $('lobbyReqBar').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-lr]'); if (!b || !host) return;
+    if (b.dataset.lr === 'no') { host.room.lobbyReq = null; hostBroadcast(); } else confirmAbort();
+  });
+  var seenNotice = null;
+  function abortUi(v) {
+    if (seenNotice === null) seenNotice = v.notice ? v.notice.id : 0;
+    else if (v.notice && v.notice.id !== seenNotice) { seenNotice = v.notice.id; if (!host && v.phase === 'lobby') toast(v.notice.msg + '。ロビーで次のゲームを待っています'); }
+    if (v.phase === 'lobby') overlay('menuModal', false);
+    var bar = $('lobbyReqBar'), key = host && v.lobbyReq && v.phase !== 'lobby' ? v.lobbyReq.sid + ':' + v.lobbyReq.at : '';
+    if (bar.dataset.key !== key) {
+      bar.dataset.key = key;
+      bar.innerHTML = key ? '<span>🙋 ' + esc(v.lobbyReq.name) + '「ロビーに戻りたい」</span><button data-lr="abort">中断してロビーへ</button><button data-lr="no" class="ghost">とじる</button>' : '';
+      bar.classList.toggle('show', !!key);
+    }
+  }
+
 
   // ---- 自分の操作（ホストは直接、参加者は送信） ----
   var lastView = null, actSent = '';
@@ -524,6 +574,7 @@
   var lastEvId = null, lastStage = -1, seenReact = null, lastTurnKey = '', cineShown = '', lastOverKey = '';
   function render(v) {
     lastView = v; window.__ds.view = v;
+    abortUi(v);
     if (lastEvId === null) { lastEvId = v.ev ? v.ev.id : 0; seenReact = v.reacts && v.reacts.length ? v.reacts[v.reacts.length - 1].id : 0; }
     if (v.phase === 'lobby') { show('lobby'); renderLobby(v); setDanger(0); SND.setPlay(false); overlay('sigModal', false); hideCine(); }
     else if (v.phase === 'play') { show('play'); renderPlay(v); SND.setPlay(true); hideCine(); }
